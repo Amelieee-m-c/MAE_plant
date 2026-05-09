@@ -1,0 +1,5 @@
+__pycache__/
+plant_PAD/
+PlantVillage_Split_721/
+*.pth*
+*.log
