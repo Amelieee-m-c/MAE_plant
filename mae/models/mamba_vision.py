@@ -21,10 +21,11 @@ except:
     from timm.models._builder import _update_default_model_kwargs as update_args
 from timm.models.vision_transformer import Mlp, PatchEmbed
 from timm.models.layers import DropPath, trunc_normal_
+from timm.models.registry import register_model
 import torch.nn.functional as F
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from einops import rearrange, repeat
-from registry import register_pip_model
+from .registry import register_pip_model
 from pathlib import Path
 
 
@@ -91,6 +92,15 @@ default_cfgs = {
 
 
 def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, C, H, W)
+        window_size: window size
+        h_w: Height of window
+        w_w: Width of window
+    Returns:
+        local window features (num_windows*B, window_size*window_size, C)
+    """
     B, C, H, W = x.shape
     x = x.view(B, C, H // window_size, window_size, W // window_size, window_size)
     windows = x.permute(0, 2, 4, 3, 5, 1).reshape(-1, window_size*window_size, C)
@@ -98,13 +108,37 @@ def window_partition(x, window_size):
 
 
 def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: local window features (num_windows*B, window_size, window_size, C)
+        window_size: Window size
+        H: Height of image
+        W: Width of image
+    Returns:
+        x: (B, C, H, W)
+    """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 5, 1, 3, 2, 4).reshape(B,windows.shape[2], H, W)
+    x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, windows.shape[2], H, W)
     return x
 
 
 def _load_state_dict(module, state_dict, strict=False, logger=None):
+    """Load state_dict to a module.
+
+    This method is modified from :meth:`torch.nn.Module.load_state_dict`.
+    Default value for ``strict`` is set to ``False`` and the message for
+    param mismatch will be shown even if strict is False.
+
+    Args:
+        module (Module): Module that receives the state_dict.
+        state_dict (OrderedDict): Weights.
+        strict (bool): whether to strictly enforce that the keys
+            in :attr:`state_dict` match the keys returned by this module's
+            :meth:`~torch.nn.Module.state_dict` function. Default: ``False``.
+        logger (:obj:`logging.Logger`, optional): Logger to log the error
+            message. If not specified, print function will be used.
+    """
     unexpected_keys = []
     all_missing_keys = []
     err_msg = []
@@ -137,7 +171,6 @@ def _load_state_dict(module, state_dict, strict=False, logger=None):
         err_msg.append(
             f'missing keys in source state_dict: {", ".join(missing_keys)}\n')
 
-    
     if len(err_msg) > 0:
         err_msg.insert(
             0, 'The model and loaded state dict do not match exactly\n')
@@ -155,7 +188,22 @@ def _load_checkpoint(model,
                     map_location='cpu',
                     strict=False,
                     logger=None):
-    checkpoint = torch.load(filename, map_location=map_location)
+    """Load checkpoint from a file or URI.
+
+    Args:
+        model (Module): Module to load checkpoint.
+        filename (str): Accept local filepath, URL, ``torchvision://xxx``,
+            ``open-mmlab://xxx``. Please refer to ``docs/model_zoo.md`` for
+            details.
+        map_location (str): Same as :func:`torch.load`.
+        strict (bool): Whether to allow different params for the model and
+            checkpoint.
+        logger (:mod:`logging.Logger` or None): The logger for error message.
+
+    Returns:
+        dict or OrderedDict: The loaded checkpoint.
+    """
+    checkpoint = torch.load(filename, map_location=map_location, weights_only=False)
     if not isinstance(checkpoint, dict):
         raise RuntimeError(
             f'No state_dict found in checkpoint file {filename}')
@@ -176,26 +224,54 @@ def _load_checkpoint(model,
 
 
 class Downsample(nn.Module):
+    """
+    Down-sampling block"
+    """
+
     def __init__(self,
                  dim,
                  keep_dim=False,
                  ):
+        """
+        Args:
+            dim: feature size dimension.
+            norm_layer: normalization layer.
+            keep_dim: bool argument for maintaining the resolution.
+        """
+
         super().__init__()
         if keep_dim:
             dim_out = dim
         else:
             dim_out = 2 * dim
+            
         self.reduction = nn.Sequential(
             nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
         )
+        
+        # 💡 新增：專門給 MAE 3D Token 用的通道翻倍層
+        self.token_reduction = nn.Linear(dim, dim_out, bias=False)
 
     def forward(self, x):
+        # 💡 判斷：如果是 3D Token，只做 Linear 通道翻倍，跳過空間卷積
+        if x.dim() == 3:
+            return self.token_reduction(x)
+            
         x = self.reduction(x)
         return x
 
 
 class PatchEmbed(nn.Module):
+    """
+    Patch embedding block"
+    """
+
     def __init__(self, in_chans=3, in_dim=64, dim=96):
+        """
+        Args:
+            in_chans: number of input channels.
+            dim: feature size dimension.
+        """
         super().__init__()
         self.proj = nn.Identity()
         self.conv_down = nn.Sequential(
@@ -214,14 +290,16 @@ class PatchEmbed(nn.Module):
 
 
 class ConvBlock(nn.Module):
+
     def __init__(self, dim,
                  drop_path=0.,
                  layer_scale=None,
                  kernel_size=3):
         super().__init__()
+
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
         self.norm1 = nn.BatchNorm2d(dim, eps=1e-5)
-        self.act1 = nn.GELU(approximate= 'tanh')
+        self.act1 = nn.GELU(approximate='tanh')
         self.conv2 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
         self.norm2 = nn.BatchNorm2d(dim, eps=1e-5)
         self.layer_scale = layer_scale
@@ -324,6 +402,10 @@ class MambaVisionMixer(nn.Module):
         )
 
     def forward(self, hidden_states):
+        """
+        hidden_states: (B, L, D)
+        Returns: same shape as hidden_states
+        """
         _, seqlen, _ = hidden_states.shape
         xz = self.in_proj(hidden_states)
         xz = rearrange(xz, "b l d -> b d l")
@@ -354,6 +436,7 @@ class MambaVisionMixer(nn.Module):
     
 
 class Attention(nn.Module):
+
     def __init__(
             self,
             dim,
@@ -386,7 +469,7 @@ class Attention(nn.Module):
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
-             q, k, v,
+                q, k, v,
                 dropout_p=self.attn_drop.p,
             )
         else:
@@ -423,14 +506,14 @@ class Block(nn.Module):
         self.norm1 = norm_layer(dim)
         if counter in transformer_blocks:
             self.mixer = Attention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-            norm_layer=norm_layer,
-        )
+                dim,
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_scale,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+                norm_layer=norm_layer,
+            )
         else:
             self.mixer = MambaVisionMixer(d_model=dim, 
                                           d_state=8,  
@@ -443,8 +526,8 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         use_layer_scale = layer_scale is not None and type(layer_scale) in [int, float]
-        self.gamma_1 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
-        self.gamma_2 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
+        self.gamma_1 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
+        self.gamma_2 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
 
     def forward(self, x):
         x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x)))
@@ -453,6 +536,10 @@ class Block(nn.Module):
 
 
 class MambaVisionLayer(nn.Module):
+    """
+    MambaVision layer"
+    """
+
     def __init__(self,
                  dim,
                  depth,
@@ -468,8 +555,28 @@ class MambaVisionLayer(nn.Module):
                  drop_path=0.,
                  layer_scale=None,
                  layer_scale_conv=None,
-                 transformer_blocks = [],
+                 transformer_blocks=[],
     ):
+        """
+        Args:
+            dim: feature size dimension.
+            depth: number of layers in each stage.
+            window_size: window size in each stage.
+            conv: bool argument for conv stage flag.
+            downsample: bool argument for down-sampling.
+            mlp_ratio: MLP ratio.
+            num_heads: number of heads in each stage.
+            qkv_bias: bool argument for query, key, value learnable bias.
+            qk_scale: bool argument to scaling query, key.
+            drop: dropout rate.
+            attn_drop: attention dropout rate.
+            drop_path: drop path rate.
+            norm_layer: normalization layer.
+            layer_scale: layer scaling coefficient.
+            layer_scale_conv: conv layer scaling coefficient.
+            transformer_blocks: list of transformer blocks.
+        """
+
         super().__init__()
         self.conv = conv
         self.transformer_block = False
@@ -499,13 +606,24 @@ class MambaVisionLayer(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
+        # ── 3D token mode (B, N, C)：MAE 的 Stage3/Stage4 走這裡 ──
+        if x.dim() == 3:
+            for blk in self.blocks:
+                x = blk(x)
+            
+            # 💡 修改：不要直接 return，交給 downsample 進行維度翻倍
+            if self.downsample is None:
+                return x
+            return self.downsample(x)
+
+        # ── 4D feature map mode (B, C, H, W)：原版分類任務走這裡 ──
         _, _, H, W = x.shape
 
         if self.transformer_block:
             pad_r = (self.window_size - W % self.window_size) % self.window_size
             pad_b = (self.window_size - H % self.window_size) % self.window_size
             if pad_r > 0 or pad_b > 0:
-                x = torch.nn.functional.pad(x, (0,pad_r,0,pad_b))
+                x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
                 _, _, Hp, Wp = x.shape
             else:
                 Hp, Wp = H, W
@@ -513,16 +631,22 @@ class MambaVisionLayer(nn.Module):
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
+
         if self.transformer_block:
             x = window_reverse(x, self.window_size, Hp, Wp)
             if pad_r > 0 or pad_b > 0:
                 x = x[:, :, :H, :W].contiguous()
+
         if self.downsample is None:
             return x
         return self.downsample(x)
 
 
 class MambaVision(nn.Module):
+    """
+    MambaVision,
+    """
+
     def __init__(self,
                  dim,
                  in_dim,
@@ -540,6 +664,24 @@ class MambaVision(nn.Module):
                  layer_scale=None,
                  layer_scale_conv=None,
                  **kwargs):
+        """
+        Args:
+            dim: feature size dimension.
+            depths: number of layers in each stage.
+            window_size: window size in each stage.
+            mlp_ratio: MLP ratio.
+            num_heads: number of heads in each stage.
+            drop_path_rate: drop path rate.
+            in_chans: number of input channels.
+            num_classes: number of classes.
+            qkv_bias: bool argument for query, key, value learnable bias.
+            qk_scale: bool argument to scaling query, key.
+            drop_rate: dropout rate.
+            attn_drop_rate: attention dropout rate.
+            norm_layer: normalization layer.
+            layer_scale: layer scaling coefficient.
+            layer_scale_conv: conv layer scaling coefficient.
+        """
         super().__init__()
         num_features = int(dim * 2 ** (len(depths) - 1))
         self.num_classes = num_classes
@@ -568,25 +710,7 @@ class MambaVision(nn.Module):
         self.norm = nn.BatchNorm2d(num_features)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Linear(num_features, num_classes) if num_classes > 0 else nn.Identity()
-        
-        # --- 修正區塊 ---
-        self.cls_token = None
-        # ----------------------
-        
         self.apply(self._init_weights)
-
-    # --- 修正區塊 ---
-    @property
-    def blocks(self):
-        all_blocks = []
-        for level in self.levels:
-            for block in level.blocks:
-                all_blocks.append(block)
-        return nn.ModuleList(all_blocks)
-
-    def no_weight_decay(self):
-        return self.no_weight_decay_keywords()
-    # ----------------------
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -605,9 +729,9 @@ class MambaVision(nn.Module):
 
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
-        return {'rpb', 'head.bias'}
+        return {'rpb'}
 
-    def forward_features(self, x):
+    def forward_features(self, x):  # 資料流
         x = self.patch_embed(x)
         for level in self.levels:
             x = level(x)
@@ -621,8 +745,12 @@ class MambaVision(nn.Module):
         x = self.head(x)
         return x
 
-    def _load_state_dict(self, pretrained, strict: bool = False):
-        _load_checkpoint(self, pretrained, strict=strict)
+    def _load_state_dict(self, 
+                         pretrained, 
+                         strict: bool = False):
+        _load_checkpoint(self, 
+                         pretrained, 
+                         strict=strict)
 
 
 @register_pip_model

@@ -7,6 +7,7 @@
 # References:
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
+# MambaVision: https://github.com/NVlabs/MambaVision
 # --------------------------------------------------------
 
 import argparse
@@ -22,7 +23,6 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 
 import timm
-
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
@@ -34,9 +34,19 @@ from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_vit
-import mamba_vision
+from models import mamba_vision
 
 from engine_finetune import train_one_epoch, evaluate
+
+
+# MambaVision 支援的模型名稱
+MAMBA_MODELS = [
+    'mamba_vision_T', 'mamba_vision_T2', 'mamba_vision_S',
+    'mamba_vision_B', 'mamba_vision_B_21k',
+    'mamba_vision_L', 'mamba_vision_L_21k',
+    'mamba_vision_L2', 'mamba_vision_L2_512_21k',
+    'mamba_vision_L3_256_21k', 'mamba_vision_L3_512_21k',
+]
 
 
 def get_args_parser():
@@ -50,10 +60,8 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
-
     parser.add_argument('--input_size', default=224, type=int,
                         help='images input size')
-
     parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
 
@@ -62,17 +70,14 @@ def get_args_parser():
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--layer_decay', type=float, default=0.75,
-                        help='layer-wise lr decay from ELECTRA/BEiT')
-
+                        help='layer-wise lr decay from ELECTRA/BEiT (ViT only)')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
-
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='epochs to warmup LR')
 
@@ -84,7 +89,7 @@ def get_args_parser():
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
 
-    # * Random Erase params
+    # Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
                         help='Random erase prob (default: 0.25)')
     parser.add_argument('--remode', type=str, default='pixel',
@@ -94,7 +99,7 @@ def get_args_parser():
     parser.add_argument('--resplit', action='store_true', default=False,
                         help='Do not random erase first (clean) augmentation split')
 
-    # * Mixup params
+    # Mixup params
     parser.add_argument('--mixup', type=float, default=0,
                         help='mixup alpha, mixup enabled if > 0.')
     parser.add_argument('--cutmix', type=float, default=0,
@@ -108,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--mixup_mode', type=str, default='batch',
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
-    # * Finetuning params
+    # Finetuning params
     parser.add_argument('--finetune', default='',
                         help='finetune from checkpoint')
     parser.add_argument('--global_pool', action='store_true')
@@ -121,7 +126,6 @@ def get_args_parser():
                         help='dataset path')
     parser.add_argument('--nb_classes', default=1000, type=int,
                         help='number of the classification types')
-
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
@@ -131,13 +135,12 @@ def get_args_parser():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
-
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true',
                         help='Perform evaluation only')
     parser.add_argument('--dist_eval', action='store_true', default=False,
-                        help='Enabling distributed evaluation (recommended during training for faster monitor')
+                        help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
@@ -173,7 +176,7 @@ def main(args):
     dataset_train = build_dataset(is_train=True, args=args)
     dataset_val = build_dataset(is_train=False, args=args)
 
-    if True:  # args.distributed:
+    if True:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -223,61 +226,69 @@ def main(args):
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
-    
-    # --- 專用修正區塊：模型建立 ---
-    if 'mamba' in args.model:
-        print(f"偵測到 Mamba 系列模型，正在載入: {args.model}")
-        if hasattr(mamba_vision, args.model):
-            model_fn = getattr(mamba_vision, args.model)
-            model = model_fn(num_classes=args.nb_classes)
-        else:
-            print(f"錯誤：在 mamba_vision.py 中找不到 {args.model}")
-            print("嘗試直接呼叫 mamba_vision_T...")
-            model = mamba_vision.mamba_vision_T(num_classes=args.nb_classes)
+
+    # ----------------------------------------------------------------
+    # 建立模型
+    # ----------------------------------------------------------------
+    if args.model in MAMBA_MODELS:
+        model = mamba_vision.__dict__[args.model](
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_path_rate=args.drop_path,
+        )
     else:
         model = models_vit.__dict__[args.model](
             num_classes=args.nb_classes,
             drop_path_rate=args.drop_path,
             global_pool=args.global_pool,
         )
-    # ----------------------
 
-    # --- 專用修正區塊：權重載入 ---
+    # ----------------------------------------------------------------
+    # 載入 pretrain checkpoint
+    # ----------------------------------------------------------------
     if args.finetune and not args.eval:
-        # 加入 weights_only=False 解決 PyTorch 2.6 安全檢查
         checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
         print("Load pre-trained checkpoint from: %s" % args.finetune)
-        
-        # 動態抓取權重字典
-        if 'model' in checkpoint:
-            checkpoint_model = checkpoint['model']
-        elif 'state_dict' in checkpoint:
-            checkpoint_model = checkpoint['state_dict']
+        checkpoint_model = checkpoint['model']
+
+        if args.model in MAMBA_MODELS:
+            # 從 MAE pretrain checkpoint 取出 backbone 權重
+            backbone_state_dict = {}
+            for k, v in checkpoint_model.items():
+                if k.startswith('backbone.'):
+                    new_k = k.replace('backbone.', '')
+                    backbone_state_dict[new_k] = v
+
+            # 移除分類頭（finetune 重新訓練）
+            for k in ['head.weight', 'head.bias']:
+                if k in backbone_state_dict:
+                    del backbone_state_dict[k]
+
+            msg = model.load_state_dict(backbone_state_dict, strict=False)
+            print(msg)
+            print("Loaded backbone keys: %d" % len(backbone_state_dict))
+
+            # 重新初始化分類頭
+            trunc_normal_(model.head.weight, std=2e-5)
+
         else:
-            checkpoint_model = checkpoint
-            
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
+            # 原版 ViT 載入方式
+            state_dict = model.state_dict()
+            for k in ['head.weight', 'head.bias']:
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    print(f"Removing key {k} from pretrained checkpoint")
+                    del checkpoint_model[k]
 
-        # 只有非 Mamba 模型才執行位置編碼插值
-        if 'mamba' not in args.model:
             interpolate_pos_embed(model, checkpoint_model)
+            msg = model.load_state_dict(checkpoint_model, strict=False)
+            print(msg)
 
-        # 載入權重
-        msg = model.load_state_dict(checkpoint_model, strict=False)
-        print(msg)
+            if args.global_pool:
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            else:
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
-        if args.global_pool and 'mamba' not in args.model:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        elif 'mamba' not in args.model:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
-    # ----------------------
+            trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
 
@@ -288,13 +299,12 @@ def main(args):
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
-    if args.lr is None:  # only base_lr is specified
+
+    if args.lr is None:
         args.lr = args.blr * eff_batch_size / 256
 
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
-
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
 
@@ -302,14 +312,25 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    # --- 阿荷專用修正區塊：優化器初始化 ---
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
-        no_weight_decay_list=model_without_ddp.no_weight_decay() if hasattr(model_without_ddp, 'no_weight_decay') else {},
-        layer_decay=args.layer_decay
-    )
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    # ----------------------
-    
+    # ----------------------------------------------------------------
+    # Optimizer
+    # ----------------------------------------------------------------
+    if args.model in MAMBA_MODELS:
+        # MambaVision 不用 layer-wise decay
+        optimizer = torch.optim.AdamW(
+            model_without_ddp.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay
+        )
+    else:
+        # 原版 ViT 用 layer-wise decay
+        param_groups = lrd.param_groups_lrd(
+            model_without_ddp, args.weight_decay,
+            no_weight_decay_list=model_without_ddp.no_weight_decay(),
+            layer_decay=args.layer_decay
+        )
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+
     loss_scaler = NativeScaler()
 
     if mixup_fn is not None:
@@ -357,9 +378,9 @@ def main(args):
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
+                     **{f'test_{k}': v for k, v in test_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
