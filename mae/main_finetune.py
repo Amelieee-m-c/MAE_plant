@@ -249,19 +249,36 @@ def main(args):
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
         print("Load pre-trained checkpoint from: %s" % args.finetune)
-        checkpoint_model = checkpoint['model']
+
+        if 'model' in checkpoint:
+            checkpoint_model = checkpoint['model']
+        elif 'state_dict' in checkpoint:
+            checkpoint_model = checkpoint['state_dict']
+        else:
+            checkpoint_model = checkpoint
 
         if args.model in MAMBA_MODELS:
-            # 從 MAE pretrain checkpoint 取出 backbone 權重
             backbone_state_dict = {}
-            for k, v in checkpoint_model.items():
-                if k.startswith('backbone.'):
-                    new_k = k.replace('backbone.', '')
-                    backbone_state_dict[new_k] = v
+
+            # 判斷是 MAE pretrain checkpoint（key 有 backbone. 前綴）
+            # 還是官方 NVIDIA checkpoint（key 直接是模型 weight）
+            has_backbone_prefix = any(k.startswith('backbone.') for k in checkpoint_model.keys())
+
+            if has_backbone_prefix:
+                print("Detected MAE pretrain checkpoint, extracting backbone weights...")
+                for k, v in checkpoint_model.items():
+                    if k.startswith('backbone.'):
+                        new_k = k.replace('backbone.', '')
+                        backbone_state_dict[new_k] = v
+            else:
+                print("Detected official NVIDIA checkpoint, loading directly...")
+                for k, v in checkpoint_model.items():
+                    backbone_state_dict[k] = v
 
             # 移除分類頭（finetune 重新訓練）
             for k in ['head.weight', 'head.bias']:
                 if k in backbone_state_dict:
+                    print(f"Removing key {k} from pretrained checkpoint")
                     del backbone_state_dict[k]
 
             msg = model.load_state_dict(backbone_state_dict, strict=False)

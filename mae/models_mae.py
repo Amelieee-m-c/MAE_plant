@@ -59,6 +59,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.norm_pix_loss = norm_pix_loss
 
         self.initialize_weights()
+       
 
     def initialize_weights(self):
         # initialization
@@ -298,6 +299,26 @@ class MaskedAutoencoderMambaVision(nn.Module):
 
         self.norm_pix_loss = norm_pix_loss
         self.initialize_weights()
+
+        # =====================================================================
+        # 正確的位置在這邊！【第一階段：MAE 預訓練】的 Tokenizer 凍結 
+        # =====================================================================
+        print("====== [MAE Pretrain] 正在鎖定 MambaVision 前段 CNN Tokenizer 權重 ======")
+        
+        # 1. 凍結最前面的 Patch Embedding 層
+        for param in self.backbone.patch_embed.parameters():
+            param.requires_grad = False
+            
+        # 2. 凍結 Stage 1 (levels[0])
+        for param in self.backbone.levels[0].parameters():
+            param.requires_grad = False
+            
+        # 3. 凍結 Stage 2 (levels[1])
+        for param in self.backbone.levels[1].parameters():
+            param.requires_grad = False
+            
+        print("====== [MAE Pretrain] 鎖定成功！僅訓練後段 Mamba Stages (levels[2, 3]) 與 Decoder ======")
+        # =====================================================================
 
     # ------------------------------------------------------------------
     # 初始化

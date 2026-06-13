@@ -606,30 +606,26 @@ class MambaVisionLayer(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
-        # ── 3D token mode (B, N, C)：MAE 的 Stage3/Stage4 走這裡 ──
         if x.dim() == 3:
             for blk in self.blocks:
                 x = blk(x)
-            
-            # 💡 修改：不要直接 return，交給 downsample 進行維度翻倍
             if self.downsample is None:
                 return x
             return self.downsample(x)
 
-        # ── 4D feature map mode (B, C, H, W)：原版分類任務走這裡 ──
+        # 4D feature map mode
         _, _, H, W = x.shape
-
         if self.transformer_block:
             pad_r = (self.window_size - W % self.window_size) % self.window_size
             pad_b = (self.window_size - H % self.window_size) % self.window_size
             if pad_r > 0 or pad_b > 0:
-                x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
+                x = F.pad(x, (0, pad_r, 0, pad_b))
                 _, _, Hp, Wp = x.shape
             else:
                 Hp, Wp = H, W
             x = window_partition(x, self.window_size)
 
-        for _, blk in enumerate(self.blocks):
+        for blk in self.blocks:
             x = blk(x)
 
         if self.transformer_block:
@@ -640,6 +636,7 @@ class MambaVisionLayer(nn.Module):
         if self.downsample is None:
             return x
         return self.downsample(x)
+        
 
 
 class MambaVision(nn.Module):

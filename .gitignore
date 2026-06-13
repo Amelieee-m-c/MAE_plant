@@ -5,7 +5,9 @@ PlantCLEF2024singleplanttrainingdata_800_max_side_size/
 PlantVillage_Split_721/
 *.pth*
 *.log
+*.tar
 eval_mamba_results/
+eval2_mamba_results/
 eval_mamba100_results/
 eval_mamba400_results/
 eval_vit_results/
@@ -22,3 +24,9 @@ output_vitbase_plantclef400_finetune/
 output_vitbase_plantclef400_pretrain/
 output_vitlarge_plantclef100_finetune/
 output_vitlarge_plantclef100_pretrain/
+output_mambavision_mae_plantclef_finetune/
+output_mambavision_mae_plantvillage_finetune/
+output_mambavision_plantCLEF_baseline/
+output_mambavision_plantvillage_baseline/
+output_vitbase_mae_plantvillage_finetune/
+output_vitbase_plantclef_pretrain/
